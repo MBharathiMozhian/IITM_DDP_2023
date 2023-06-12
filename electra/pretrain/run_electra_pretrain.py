@@ -1,0 +1,873 @@
+"""
+Pre-training language models using the ELECTRA method.
+"""
+
+import os
+os.environ['HOME'] = "/scratch/scratch6/bharathimozhian/electra_mlm"
+import logging
+import math
+import multiprocessing
+import glob
+import tarfile
+from dataclasses import dataclass, field
+from itertools import chain
+from pathlib import Path
+from typing import Dict, Optional, Tuple, Union
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import IterableDataset
+from tqdm import tqdm
+
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    ElectraTokenizerFast,
+    RobertaTokenizerFast,
+    ElectraForMaskedLM,
+    ElectraForPreTraining,
+    EvalPrediction,
+    HfArgumentParser,
+    PreTrainedTokenizer,
+    TextDataset,
+    # Trainer,
+    set_seed,
+)
+from transformers.data.data_collator import DataCollator
+from transformers.modeling_utils import PreTrainedModel
+from transformers.training_args import TrainingArguments
+from transformers.trainer_callback import EarlyStoppingCallback
+from deepchem.feat.smiles_tokenizer import SmilesTokenizer
+
+from trainer import Trainer # Using Trainer class from `trainer.py`
+
+import hyperparams
+
+import wandb
+# wandb.login(key="639e80381d96cc4d5ce8e3e6cadf7261701e661d")
+# wandb.init(project='smiles_electra_100k')
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
+    """
+
+    discriminator_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The discriminator checkpoint for weights initialization. Leave None if you want to train a model "
+            "from scratch."
+        },
+    )
+
+    discriminator_config_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Pretrained config name or path if not the same as the discriminator model_name"},
+    )
+
+    generator_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The generator checkpoint for weights initialization. Leave None if you want to train a model "
+            "from scratch."
+        },
+    )
+
+    generator_config_name: Optional[str] = field(
+        default=None, 
+        metadata={"help": "Pretrained config name or path if not the same as the generator model_name"}
+    )
+
+    tokenizer_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Pretrained tokenizer name or path if not the same as discriminator model_name"},
+    )
+
+    cache_dir: Optional[str] = field(
+        default=hyperparams.cache_dir, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+    )
+
+
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    """
+
+    train_data_file: Optional[str] = field(
+        default=None, metadata={"help": "The input training data file (a text file)."}
+    )
+
+    eval_data_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
+    )
+
+    open_web_text_directory: Optional[str] = field(
+        default=None,
+        metadata={"help": "The directory containing files that will be used for training and evaluation."},
+    )
+
+    block_size: int = field(
+        default=hyperparams.tokenizer_block_size,
+        metadata={
+            "help": "Optional input sequence length after tokenization."
+            "The training dataset will be truncated in block of this size for training."
+            "Default to the model max input length for single sentence inputs (take into account special tokens)."
+        },
+    )
+
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+
+    num_dataset_building_processes: int = field(
+        default=1, metadata={"help": "The number of workers that will be used to build the dataset."}
+    )
+
+    num_tensors_per_file: int = field(
+        default=2048,
+        metadata={
+            "help": "The number of tensors that will be stored in each file after tokenization."
+            "The smaller the amount, the smaller the filesize, but the larger the amount"
+            "of files that will be created."
+        },
+    )
+
+    mask_probability: float = field(
+        default=hyperparams.mlm_probability, metadata={"help": "Percentage of the input that will be masked or replaced."}
+    )
+
+    max_predictions_per_sequence: int = field(
+        default=-1, metadata={"help": "Maximum tokens that will be masked in a sequence."},
+    )
+
+
+@dataclass
+class ElectraTrainingArguments(TrainingArguments):
+    max_steps: int = field(
+        default=1_000_000,
+        metadata={"help": "If > 0: set total number of training steps to perform. Override num_train_epochs."},
+    )
+
+    max_eval_steps: int = field(
+        default=100, metadata={"help": "If > 0: set total number of eval steps to perform."},
+    )
+    warmup_steps: int = field(default=10_000, metadata={"help": "Linear warmup over warmup_steps."})
+
+    weight_decay: float = field(default=0.1, metadata={"help": "Weight decay if we apply some."})
+
+    generator_weight: float = field(default=1.0, metadata={"help": "Weight coefficient for the generator loss"})
+
+    discriminator_weight: float = field(
+        default=50.0, metadata={"help": "Weight coefficient for the discriminator loss"}
+    )
+
+    output_dir: str = field(
+        default=os.path.join(hyperparams.output_dir, hyperparams.run_name), 
+        metadata={"help": "Output directory of the model checkpoints"}
+    )
+
+    run_name: str = field(
+    default=hyperparams.run_name, metadata={"help": "Run name"}
+    )
+
+    report_to: str = field(
+        default='wandb', metadata={"help": "Integrations to report the logs and results to"}
+    )
+
+    is_gpu = torch.cuda.is_available()
+
+    learning_rate: float = field(
+    default=5e-4, metadata={"help": "Adam optimizer hyperparameter"}
+    )
+
+    weight_decay: float = field(
+    default=0.01, metadata={"help": "Adam optimizer hyperparameter"}
+    )
+
+    adam_beta1: float = field(
+    default=0.9, metadata={"help": "Adam optimizer hyperparameter"}
+    )
+    
+    adam_beta2: float = field(
+    default=0.999, metadata={"help": "Adam optimizer hyperparameter"}
+    )
+
+    adam_epsilon: float = field(
+    default=1e-6, metadata={"help": "Adam optimizer hyperparameter"}
+    )
+
+
+def get_dataset(
+    data_args: DataTrainingArguments,
+    training_args: TrainingArguments,
+    model_args: ModelArguments,
+    tokenizer: Union[PreTrainedTokenizer, str],
+    evaluate=False,
+    # local_rank=-1,
+):
+    if data_args.open_web_text_directory is not None:
+        # Whether to overwrite the cache. We don't want to overwrite the cache when evaluating if we're both training
+        # and evaluating, as the same dataset is used. We don't need to tokenize twice for training
+        # and evaluation.
+        should_overwrite_cache = False
+
+        # If argument is specified and training, then respect the argument
+        if data_args.overwrite_cache and not evaluate:
+            should_overwrite_cache = True
+        if data_args.overwrite_cache and training_args.do_eval and not training_args.do_train:
+            should_overwrite_cache = True
+
+        return OpenWebTextDataset(data_args, model_args, overwrite_cache=should_overwrite_cache)
+    else:
+        file_path = data_args.eval_data_file if evaluate else data_args.train_data_file
+        return TextDataset(
+            tokenizer=tokenizer, file_path=file_path, block_size=data_args.block_size) #, local_rank=local_rank)
+
+
+# class OpenWebTextDataset(IterableDataset):
+#     def __init__(self, data_args, model_args, overwrite_cache=False):
+#         self.tokenizer_cache = model_args.cache_dir
+#         self.directory = Path(data_args.open_web_text_directory)
+#         self.archives = os.listdir(self.directory)
+#         self.tokenizer_identifier = model_args.tokenizer_name
+#         self.num_tensors_per_file = data_args.num_tensors_per_file
+#         self.feature_directory = (
+#             self.directory
+#             / f"features_{self.tokenizer_identifier.replace('/', '_')}_{data_args.block_size if data_args.block_size is not None else 'no-max-seq'}_{self.num_tensors_per_file}"
+#         )
+#         self.block_size = data_args.block_size
+
+#         # The dataset was already processed
+#         if os.path.exists(self.feature_directory) and not overwrite_cache:
+#             # logger.info(
+#             #     f"Re-using cache from {self.feature_directory}. Warning: we have no way of detecting an "
+#             #     f"incomplete cache. If the tokenization was started but not finished, please use the "
+#             #     f"`--ignore_cache=True` flag."
+#             # )
+#             self.feature_set_paths = [
+#                 self.feature_directory / feature_set_path for feature_set_path in os.listdir(self.feature_directory)
+#             ]
+#             return
+
+#         # logger.info(f"Writing features at {self.feature_directory}")
+#         os.makedirs(self.feature_directory, exist_ok=overwrite_cache)
+
+#         n_archives_per_job = math.ceil(len(self.archives) / data_args.num_dataset_building_processes)
+#         self.job_archives = [
+#             self.archives[i * n_archives_per_job : (i + 1) * n_archives_per_job]
+#             for i in range(data_args.num_dataset_building_processes)
+#         ]
+#         # Sanity check: make sure we're not leaving any archive behind.
+#         assert sum([len(archive) for archive in self.job_archives]) == len(self.archives)
+
+#         if data_args.num_dataset_building_processes == 1:
+#             self.feature_set_paths = self._extract_open_web_text()
+#         else:
+#             pool = multiprocessing.Pool(processes=data_args.num_dataset_building_processes)
+#             self.feature_set_paths = pool.map(
+#                 self._extract_open_web_text, range(data_args.num_dataset_building_processes)
+#             )
+#             self.feature_set_paths = [file_path for feature_set in self.feature_set_paths for file_path in feature_set]
+
+#     def _extract_open_web_text(self, job_id=0):
+#         """
+#         OpenWebText is saved under the following format:
+#         openwebtext.zip
+#             |-> archive_xxx.zip
+#                 |-> file_xxx.txt
+#                 |-> file_xxz.txt
+#                 ...
+#             |-> archive_xxz.zip
+#                 |-> file_xxy.txt
+#                 ...
+#             ...
+#         """
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             self.tokenizer_identifier, use_fast=True, cache_dir=self.tokenizer_cache
+#         )
+
+#         # Create openwebtext/tmp directory to store temporary files
+#         temporary_directory = self.directory / "tmp" / f"job_{job_id}"
+#         feature_index = 0
+#         feature_set_paths = []
+
+#         os.makedirs(temporary_directory, exist_ok=True)
+
+#         # Extract archives and tokenize in directory
+#         progress_bar = tqdm(
+#             self.job_archives[job_id], desc="Extracting archives", total=len(self.job_archives[0]), disable=job_id != 0
+#         )
+
+#         features = []
+#         for archive in progress_bar:
+#             if os.path.isdir(self.directory / archive):
+#                 # logger.info("Ignoring rogue directory.")
+#                 continue
+#             with tarfile.open(self.directory / archive) as t:
+#                 extracted_archive = temporary_directory / f"{archive}-extracted"
+#                 t.extractall(extracted_archive)
+
+#             files = os.listdir(extracted_archive)
+#             for file in files:
+#                 file_path = extracted_archive / file
+
+#                 with open(file_path, "r") as f:
+#                     text = f.read()
+#                     block_size = tokenizer.model_max_length if self.block_size is None else self.block_size
+#                     encoding = tokenizer.encode_plus(text, return_overflowing_tokens=True, max_length=block_size)
+
+#                     features.append(torch.tensor(encoding["input_ids"]))
+
+#                     for overflowing_encoding in encoding.encodings[0].overflowing:
+#                         features.append(torch.tensor(overflowing_encoding.ids))
+
+#             while len(features) > self.num_tensors_per_file:
+#                 feature_set_path = self.feature_directory / f"feature_set_{job_id}_{feature_index}.pt"
+#                 torch.save(features[: self.num_tensors_per_file], feature_set_path)
+#                 features = features[self.num_tensors_per_file :]
+#                 feature_index += 1
+#                 feature_set_paths.append(feature_set_path)
+
+#         if len(features) > 0:
+#             feature_set_path = self.feature_directory / f"feature_set_{job_id}_{feature_index}.pt"
+#             torch.save(features, feature_set_path)
+#             feature_set_paths.append(feature_set_path)
+
+#         return feature_set_paths
+
+#     @staticmethod
+#     def parse_file(file_index):
+#         try:
+#             features = torch.load(file_index)
+#             yield from features
+#         except RuntimeError:
+#             raise RuntimeError(f"Corrupted file {file_index}")
+
+#     def __len__(self):
+#         return len(self.feature_set_paths) * self.num_tensors_per_file
+
+#     def __iter__(self):
+#         return chain.from_iterable(map(self.parse_file, self.feature_set_paths))
+
+
+class CombinedModel(nn.Module):
+    def __init__(
+        self,
+        discriminator: PreTrainedModel,
+        generator: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        training_args: ElectraTrainingArguments,
+        data_args: DataTrainingArguments,
+    ):
+        super().__init__()
+
+        self.discriminator = discriminator
+        self.generator = generator
+
+        # Embeddings are shared
+        self.discriminator.set_input_embeddings(self.generator.get_input_embeddings())
+
+        self.tokenizer = tokenizer
+
+        self.discriminator_weight = training_args.discriminator_weight
+        self.generator_weight = training_args.generator_weight
+        self.mask_probability = data_args.mask_probability
+        self.max_predictions_per_sequence = data_args.max_predictions_per_sequence
+
+        # Original implementation has a default of :(mask_probability + 0.005) * max_sequence_length
+        if self.max_predictions_per_sequence == -1:
+            self.max_predictions_per_sequence = (self.mask_probability + 0.005) * data_args.block_size
+
+        # class Config:
+        #     xla_device: bool = False
+
+        # self.config = Config()
+
+    def mask_inputs(
+        self, input_ids: torch.Tensor, tokens_to_ignore, proposal_distribution=1.0,
+    ):
+        input_ids = input_ids.clone()
+        inputs_which_can_be_masked = torch.ones_like(input_ids)
+        for token in tokens_to_ignore:
+            inputs_which_can_be_masked -= torch.eq(input_ids, token).long()
+
+        total_number_of_tokens = input_ids.shape[-1]
+
+        # Identify the number of tokens to be masked, which should be: 1 < num < max_predictions per seq.
+        # It is set to be: n_tokens * mask_probability, but is truncated if it goes beyond bounds.
+        number_of_tokens_to_be_masked = torch.min(
+            torch.tensor(self.max_predictions_per_sequence, dtype=torch.long),
+            torch.tensor(int(total_number_of_tokens * self.mask_probability), dtype=torch.long),
+        ).clamp(1)
+
+        # The probability of each token being masked
+        sample_prob = proposal_distribution * inputs_which_can_be_masked
+        sample_prob /= torch.sum(sample_prob)
+
+        # Sample from the probabilities
+        masked_lm_positions = sample_prob.multinomial(number_of_tokens_to_be_masked)
+
+        # Gather the IDs from the positions
+        masked_lm_ids = input_ids.gather(-1, masked_lm_positions)
+
+        return masked_lm_ids, masked_lm_positions
+
+    @staticmethod
+    def gather_positions(sequence, positions):
+        batch_size, sequence_length, dimension = sequence.shape
+        position_shift = (sequence_length * torch.arange(batch_size, device=sequence.device)).unsqueeze(-1)
+        flat_positions = torch.reshape(positions + position_shift, [-1]).long() # if not working - try using `reshape` instead of `view`
+        flat_positions = (positions + position_shift).view([-1]).long() # if not working - try using `reshape` instead of `view`
+        flat_sequence = sequence.view([batch_size * sequence_length, dimension]) # if not working - try using `reshape` instead of `view`
+        gathered = flat_sequence.index_select(0, flat_positions)
+        return torch.reshape(gathered, [batch_size, -1, dimension])
+
+    def forward(
+        self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, labels=None,
+    ):
+        # get the masked positions as well as their original values
+        masked_input_ids, masked_lm_positions = self.mask_inputs(
+            input_ids, [self.tokenizer.cls_token_id, self.tokenizer.sep_token_id, self.tokenizer.mask_token_id], # include - `self.tokenizer.pad_token_id` incase of any problems
+            )
+
+        # only masked values should be counted in the loss; build a tensor containing the true values and -100 otherwise
+        masked_lm_labels = torch.full_like(input_ids, -100)
+        masked_lm_labels.scatter_(-1, masked_lm_positions, masked_input_ids)
+
+        # Create a tensor filled with masks
+        masked_tokens = torch.full_like(masked_input_ids, self.tokenizer.mask_token_id)
+        masked_lm_inputs = input_ids.clone()
+
+        # Of the evaluated tokens, 15% of those will keep their original tokens
+        replace_with_mask_positions = masked_lm_positions * (
+            torch.rand(masked_lm_positions.shape, device=masked_lm_positions.device) < (1 - self.mask_probability)
+            ) # use `torch.rand_like` incase of any problems
+
+        # Scatter the masks at the masked positions
+        masked_lm_inputs.scatter_(-1, replace_with_mask_positions, masked_tokens)
+        # masked_lm_inputs.masked_fill_(replace_with_mask_positions, self.tokenizer.mask_token_id)
+        masked_lm_inputs[..., 0] = 101
+
+        generator_loss, generator_output = self.generator(
+            input_ids=masked_lm_inputs,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=position_ids,
+            labels=masked_lm_labels,
+        )[:2]
+
+        # get the generator's predicted value on each masked position
+        fake_logits = self.gather_positions(generator_output, masked_lm_positions)
+        fake_softmaxed = torch.softmax(fake_logits, dim=-1)
+        fake_sampled = fake_softmaxed\
+            .view(fake_logits.shape[0] * fake_logits.shape[1], fake_logits.shape[2])\
+            .multinomial(1)\
+            .view(fake_logits.shape[:-1])
+
+        # create a tensor containing the predicted tokens
+        fake_tokens = input_ids.scatter(-1, masked_lm_positions, fake_sampled)
+        fake_tokens[:, 0] = input_ids[:, 0]
+        discriminator_labels = (labels != fake_tokens).int()
+
+        discriminator_loss, discriminator_output = self.discriminator(
+            input_ids=fake_tokens,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=position_ids,
+            labels=discriminator_labels,
+        )[:2]
+
+        discriminator_predictions = torch.round((torch.sign(discriminator_output) + 1.0) * 0.5)
+
+        total_loss = (self.discriminator_weight * discriminator_loss) + (self.generator_weight * generator_loss)
+
+        return (
+            total_loss,
+            (generator_output, discriminator_output),
+            (masked_input_ids, fake_sampled),
+            (discriminator_labels, discriminator_predictions),
+        )
+
+    def save_pretrained(self, directory):
+        # if self.config.xla_device:
+        #     self.discriminator.config.xla_device = True
+        #     self.generator.config.xla_device = True
+        # else:
+        #     self.discriminator.config.xla_device = False
+        #     self.generator.config.xla_device = False
+
+        generator_path = os.path.join(directory, "generator")
+        discriminator_path = os.path.join(directory, "discriminator")
+
+        if not os.path.exists(generator_path):
+            os.makedirs(generator_path)
+
+        if not os.path.exists(discriminator_path):
+            os.makedirs(discriminator_path)
+
+        self.generator.save_pretrained(generator_path)
+        self.discriminator.save_pretrained(discriminator_path)
+
+
+def main():
+    # See all possible arguments in src/transformers/training_args.py
+    # or by passing the --help flag to this script.
+    # We now keep distinct sets of args, for a cleaner separation of concerns.
+
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, ElectraTrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    
+    # Assigning model_args
+    model_args.discriminator_config_name = f'google/electra-{hyperparams.size}-discriminator'
+    model_args.generator_config_name = f'google/electra-{hyperparams.size}-generator'
+    model_args.tokenizer_name = hyperparams.smiles_tokenizer_vocab_path
+    model_args.discriminator_name_or_path = os.path.join(hyperparams.output_dir, hyperparams.run_name, 'discriminator')
+    model_args.generator_name_or_path = os.path.join(hyperparams.output_dir, hyperparams.run_name, 'generator')
+
+    # Assigning data_args
+    data_args.train_data_file = hyperparams.dataset_path_100k
+    data_args.eval_data_file = hyperparams.dataset_path_1k
+
+    # Assigning training_args
+    is_gpu = torch.cuda.is_available()
+    # training_args.output_dir = hyperparams.output_dir
+    training_args.evaluation_strategy="steps"
+    training_args.logging_strategy="steps"
+    training_args.eval_steps=500
+    training_args.load_best_model_at_end=True
+    training_args.logging_steps=100
+    training_args.output_dir=os.path.join(hyperparams.output_dir, hyperparams.run_name)
+    training_args.overwrite_output_dir=hyperparams.overwrite_output_dir
+    training_args.num_train_epochs=hyperparams.num_train_epochs
+    training_args.max_steps=30000
+    training_args.per_device_train_batch_size=hyperparams.per_device_train_batch_size
+    training_args.save_steps=1000
+    training_args.save_total_limit=hyperparams.save_total_limit
+    # training_args.fp16 = is_gpu and hyperparams.fp16
+    training_args.local_rank=-1 # rank of the process during distributed training - to be looked at later
+    training_args.report_to=['wandb']
+    training_args.run_name=hyperparams.run_name
+    # training_args.learning_rate=5e-4 # AdamW optimizer hyperparameter
+    # training_args.weight_decay=0.01 # AdamW optimizer hyperparameter
+    # training_args.adam_beta1=0.9 # AdamW optimizer hyperparameter
+    # training_args.adam_beta2=0.999 # AdamW optimizer hyperparameter
+    # training_args.adam_epsilon=1e-6 # AdamW optimizer hyperparameter
+    training_args.do_train=True
+    training_args.do_eval=True
+    
+    if data_args.open_web_text_directory is None and data_args.eval_data_file is None and training_args.do_eval:
+        raise ValueError(
+            "Cannot do evaluation without an evaluation data file. Either supply a file to --eval_data_file "
+            "or remove the --do_eval argument."
+        )
+
+    if (
+        os.path.exists(training_args.output_dir)
+        and os.listdir(training_args.output_dir)
+        and training_args.do_train
+        and not training_args.overwrite_output_dir
+    ):
+        raise ValueError(
+            f"Output directory ({training_args.output_dir}) already exists and is not empty. Use --overwrite_output_dir to overcome."
+        )
+
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO # if training_args.local_rank in [-1, 0] else logging.WARN,
+    )
+    logger.warning(
+        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+        training_args.local_rank,
+        training_args.device,
+        training_args.n_gpu,
+        bool(training_args.local_rank != -1),
+        training_args.fp16,
+    )
+    logger.info("Training/evaluation parameters %s", training_args)
+
+    # Set seed
+    # set_seed(training_args.seed)
+    torch.manual_seed(training_args.seed)
+
+    # Load pretrained model and tokenizer
+    #
+    # Distributed training:
+    # The .from_pretrained methods guarantee that only one local process can concurrently
+    # download model & vocab.
+
+    if model_args.generator_config_name:
+        discriminator_config = AutoConfig.from_pretrained(
+            model_args.discriminator_config_name, cache_dir=model_args.cache_dir
+        )
+    elif model_args.discriminator_name_or_path:
+        discriminator_config = AutoConfig.from_pretrained(
+            model_args.discriminator_name_or_path, cache_dir=model_args.cache_dir
+        )
+    else:
+        raise ValueError("Either --discriminator_config_name or --discriminator_name_or_path should be specified.")
+
+    if model_args.generator_config_name:
+        generator_config = AutoConfig.from_pretrained(model_args.generator_config_name, cache_dir=model_args.cache_dir)
+    elif model_args.generator_name_or_path:
+        generator_config = AutoConfig.from_pretrained(
+            model_args.generator_name_or_path, cache_dir=model_args.cache_dir
+        )
+        # note that public electra-small model is actually small++ and don't scale down generator size
+        # scaling down generator size - (trial for fast computation)
+        # i = ['small', 'base', 'large'].index(hyperparams.size)
+        # generator_size_divisor = [4, 3, 4][i]
+        # generator_config.hidden_size = int(discriminator_config.hidden_size/generator_size_divisor) # original value = 12
+        # generator_config.num_attention_heads = discriminator_config.num_attention_heads//generator_size_divisor # original value = 4
+        # generator_config.intermediate_size = discriminator_config.intermediate_size//generator_size_divisor # original value = 1024
+    else:
+        raise ValueError("Either --generator_config_name or --generator_name_or_path should be specified.")
+
+    if model_args.tokenizer_name:
+        # tokenizer = RobertaTokenizerFast.from_pretrained(
+            # hyperparams.bpe_tokenizer_path,
+            # # vocab_file=os.path.join(model_args.tokenizer_name, 'vocab.json'), 
+            # # merges_file=os.path.join(model_args.tokenizer_name, 'merges.txt'),
+            # max_len=hyperparams.max_tokenizer_len
+            # )
+        tokenizer = SmilesTokenizer(hyperparams.smiles_tokenizer_vocab_path)
+    elif model_args.discriminator_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.discriminator_name_or_path, cache_dir=model_args.cache_dir
+        )
+        model_args.tokenizer_name = model_args.discriminator_name_or_path
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported, but you can do it from another "
+            "script, save it, and load it from here, using --tokenizer_name"
+        )
+
+    if model_args.discriminator_name_or_path:
+        discriminator = ElectraForPreTraining.from_pretrained(
+            model_args.discriminator_name_or_path,
+            from_tf=bool(".ckpt" in model_args.discriminator_name_or_path),
+            config=discriminator_config,
+            cache_dir=model_args.cache_dir,
+        )
+    else:
+        # logger.info("Training new model from scratch")
+        discriminator = ElectraForPreTraining(discriminator_config)
+
+    if model_args.generator_name_or_path:
+        generator = ElectraForMaskedLM.from_pretrained(
+            model_args.generator_name_or_path,
+            from_tf=bool(".ckpt" in model_args.generator_name_or_path),
+            config=generator_config,
+            cache_dir=model_args.cache_dir,
+        )
+    else:
+        # logger.info("Training new model from scratch")
+        generator = ElectraForMaskedLM(generator_config)
+
+    discriminator.resize_token_embeddings(len(tokenizer))
+    generator.resize_token_embeddings(len(tokenizer))
+
+    if data_args.block_size <= 0:
+        data_args.block_size = hyperparams.max_tokenizer_len # tokenizer.max_len
+        # Our input block size will be the max possible for the model
+    else:
+        data_args.block_size = min(data_args.block_size, hyperparams.max_tokenizer_len)
+
+    # Need to update this to something cleaner
+    try:
+        import torch_xla.core.xla_model as xm
+
+        if xm.is_master_ordinal(local=True):
+            get_dataset(data_args, training_args, model_args, tokenizer=tokenizer) #, local_rank=training_args.local_rank)
+
+        xm.rendezvous("dataset building")
+    except ImportError:
+        logger.info("Not running on TPU")
+        pass # changed code line
+
+    # Get datasets
+    train_dataset = (
+            get_dataset(data_args, training_args, model_args, tokenizer=tokenizer) #, local_rank=training_args.local_rank)
+            if training_args.do_train
+            else None
+        )
+    eval_dataset = (
+        get_dataset(
+            data_args,
+            training_args,
+            model_args,
+            tokenizer=tokenizer,
+            # local_rank=training_args.local_rank,
+            evaluate=True,
+        )
+        if training_args.do_eval
+        else None
+    )
+
+    # Masking is done inside the CombinedModel
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, mlm_probability=0)
+
+    model = CombinedModel(discriminator, generator, tokenizer, training_args, data_args)
+
+    def compute_metrics(evaluation_predictions: EvalPrediction) -> Dict[str, int]:
+        predictions: Dict[str, np.ndarray] = evaluation_predictions.predictions
+        labels: Dict[str, np.ndarray] = evaluation_predictions.label_ids
+
+        generator_labels, generator_predictions = labels["generator"], predictions["generator"]
+        discriminator_labels, discriminator_predictions = labels["discriminator"], predictions["discriminator"]
+
+        true_positives = (
+            np.logical_and(
+                np.equal(discriminator_predictions, discriminator_labels), np.equal(discriminator_labels, 1)
+            )
+            .sum()
+            .astype(float)
+        )
+        false_negatives = (
+            np.logical_and(
+                np.not_equal(discriminator_predictions, discriminator_labels), np.equal(discriminator_labels, 1)
+            )
+            .sum()
+            .astype(float)
+        )
+        false_positives = (
+            np.logical_and(
+                np.not_equal(discriminator_predictions, discriminator_labels), np.equal(discriminator_labels, 0)
+            )
+            .sum()
+            .astype(float)
+        )
+
+        generator_accuracy = (
+            np.equal(generator_labels, generator_predictions).sum().astype(float) / generator_predictions.size
+        )
+        discriminator_accuracy = (
+            np.equal(discriminator_labels, discriminator_predictions).sum().astype(float) / discriminator_labels.size
+        )
+        discriminator_precision = true_positives / (true_positives + false_positives)
+        discriminator_recall = true_positives / (true_positives + false_negatives)
+
+        return {
+            "generator_accuracy": generator_accuracy,
+            "discriminator_accuracy": discriminator_accuracy,
+            "discriminator_precision": discriminator_precision,
+            "discriminator_recall": discriminator_recall,
+        }
+
+    def manage_evaluation_predictions(model_outputs: Tuple[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        total_loss, models_output, generator_evaluation_values, discriminator_evaluation_values = model_outputs
+        generator_labels, generator_predictions = generator_evaluation_values
+        discriminator_labels, discriminator_predictions = discriminator_evaluation_values
+
+        return {
+            "generator_labels": generator_labels.detach(),
+            "generator_predictions": generator_predictions.detach(),
+            "discriminator_labels": discriminator_labels.detach(),
+            "discriminator_predictions": discriminator_predictions.detach(),
+        }
+
+    def eval_prediction_mapping(dictionary: Dict[str, np.ndarray]) -> EvalPrediction:
+        labels = {"generator": dictionary["generator_labels"], "discriminator": dictionary["discriminator_labels"]}
+        predictions = {
+            "generator": dictionary["generator_predictions"],
+            "discriminator": dictionary["discriminator_predictions"],
+        }
+
+        return EvalPrediction(labels, predictions)
+    
+    # Initiating WandB
+    wandb.login(key="639e80381d96cc4d5ce8e3e6cadf7261701e661d")
+    wandb.init(project='smiles_electra_base_100k')
+
+    # Initialize our Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        compute_metrics=compute_metrics,
+        manage_evaluation_predictions=manage_evaluation_predictions,
+        eval_prediction_mapping=eval_prediction_mapping,
+        prediction_loss_only=True,
+        # callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+    )
+    # print(model.config)
+    # trainer.remove_callback(WandbCallback())
+    # Trainer.add_callback(WandbCallback())
+
+    # Training
+    if training_args.do_train:
+        model_path = (
+            model_args.discriminator_name_or_path
+            if model_args.discriminator_name_or_path is not None
+            and os.path.isdir(model_args.discriminator_name_or_path)
+            else None
+        )
+        # # If existing checkpoints are present, taking those weights for initialization
+        # # if there is a checkpoint available, use it
+        run_dir = os.path.join(hyperparams.output_dir, hyperparams.run_name)
+        # final_checkpoint = glob.glob(os.path.join(run_dir, "final"))
+        # checkpoints = glob.glob(os.path.join(run_dir, "checkpoint-*"))
+        # print('checkpoints', checkpoints)
+        # if final_checkpoint:
+        #     latest_checkpoint = final_checkpoint[0]
+        #     print(latest_checkpoint)
+        #     print(f"Loading model from latest checkpoint: {latest_checkpoint}")
+        #     # torch.cuda.empty_cache()
+        #     trainer.train(model_path=model_path, resume_from_checkpoint=latest_checkpoint)
+        # elif checkpoints:
+        #     iters = [int(x.split("-")[-1]) for x in checkpoints if "checkpoint" in x]
+        #     iters.sort()
+        #     latest_checkpoint = os.path.join(run_dir, f"checkpoint-{iters[-1]}")
+        #     print(latest_checkpoint)
+        #     print(f"Loading model from latest checkpoint: {latest_checkpoint}")
+        #     trainer.train(model_path=model_path, resume_from_checkpoint=latest_checkpoint)
+        # else:
+        torch.cuda.empty_cache()
+        trainer.train(model_path=model_path)
+        
+        trainer.save_model(os.path.join(hyperparams.output_dir, hyperparams.run_name, "final"))
+        # Saving the trained generator and discriminator models
+        model.save_pretrained(run_dir)
+
+    # Evaluation
+    results = {}
+    if training_args.do_eval: # and training_args.local_rank in [-1, 0]:
+        logger.info("*** Evaluate ***")
+
+        result = trainer.evaluate()
+
+        output_eval_file = os.path.join(training_args.output_dir, "eval_results_lm.txt")
+        with open(output_eval_file, "w") as writer:
+            logger.info("***** Eval results *****")
+            for key in sorted(result.keys()):
+                logger.info("  %s = %s", key, str(result[key]))
+                writer.write("%s = %s\n" % (key, str(result[key])))
+
+        results.update(result)
+
+    return results
+
+
+def _mp_fn(index):
+    # For xla_spawn (TPUs)
+    main()
+
+
+if __name__ == "__main__":
+    main()
+
